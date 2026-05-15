@@ -1,0 +1,357 @@
+Yes, Victor. For your free PumpPortal project, the best relational structure is:
+
+```text
+creators  →  launches  →  migrations
+              ↓
+        token_keywords
+              ↓
+        raw_events
+```
+
+The most important relationship is:
+
+```text
+launches.mint = migrations.mint
+```
+
+And for creator analysis:
+
+```text
+creators.creator_wallet = launches.creator_wallet
+```
+
+## 1. Main tables you need
+
+### Table 1: `creators`
+
+Stores each unique creator wallet once.
+
+```sql
+CREATE TABLE creators (
+    creator_wallet VARCHAR(100) PRIMARY KEY,
+    first_seen_at DATETIME,
+    last_seen_at DATETIME,
+    total_launches INT DEFAULT 0,
+    total_migrations INT DEFAULT 0
+);
+```
+
+Why?
+
+This helps you later ask:
+
+```text
+Which creators launch the most tokens?
+Which creators have the highest migration rate?
+Which creators look like spam launchers?
+```
+
+---
+
+### Table 2: `launches`
+
+Stores every new token launch.
+
+```sql
+CREATE TABLE launches (
+    mint VARCHAR(100) PRIMARY KEY,
+    name VARCHAR(255),
+    symbol VARCHAR(100),
+    creator_wallet VARCHAR(100),
+    launch_time DATETIME,
+    raw_event_id BIGINT,
+
+    FOREIGN KEY (creator_wallet) REFERENCES creators(creator_wallet)
+);
+```
+
+Why?
+
+This is your main table.
+
+Each token has one `mint`, so `mint` should be the primary key.
+
+---
+
+### Table 3: `migrations`
+
+Stores tokens that migrated.
+
+```sql
+CREATE TABLE migrations (
+    migration_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    mint VARCHAR(100),
+    migration_time DATETIME,
+    raw_event_id BIGINT,
+
+    FOREIGN KEY (mint) REFERENCES launches(mint)
+);
+```
+
+Why?
+
+Not every launched token will migrate. So the relationship is:
+
+```text
+One launch may have zero or one migration
+```
+
+In SQL terms:
+
+```text
+launches 1 → 0/1 migrations
+```
+
+Later, you can calculate:
+
+```text
+time_to_migration = migration_time - launch_time
+```
+
+---
+
+### Table 4: `raw_events`
+
+Stores the full original JSON message.
+
+```sql
+CREATE TABLE raw_events (
+    raw_event_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_type ENUM('launch', 'migration', 'unknown') NOT NULL,
+    mint VARCHAR(100),
+    received_at DATETIME,
+    raw_json JSON
+);
+```
+
+Why?
+
+This protects you. If PumpPortal sends extra fields that you do not understand now, you still save everything.
+
+This is very important for your project.
+
+---
+
+### Table 5: `token_keywords`
+
+Stores detected keyword categories from names/symbols.
+
+```sql
+CREATE TABLE token_keywords (
+    keyword_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    mint VARCHAR(100),
+    keyword VARCHAR(100),
+    category ENUM('meme', 'ai', 'animal', 'celebrity', 'political', 'crypto', 'other'),
+
+    FOREIGN KEY (mint) REFERENCES launches(mint)
+);
+```
+
+Why?
+
+Example:
+
+| Token name | Keywords    |
+| ---------- | ----------- |
+| Pepe AI    | pepe, ai    |
+| Trump Doge | trump, doge |
+| CatCoin    | cat         |
+
+This helps you later analyze:
+
+```text
+Do AI tokens migrate more?
+Do animal meme tokens launch more often?
+Do political names trend during certain days?
+```
+
+## 2. How the tables relate to each other
+
+Simple relationship map:
+
+```text
+creators
+   |
+   | one creator can launch many tokens
+   ↓
+launches
+   |
+   | one launch may later migrate
+   ↓
+migrations
+
+launches
+   |
+   | one token can have many keywords
+   ↓
+token_keywords
+
+raw_events
+   |
+   | stores original JSON for launches and migrations
+   ↓
+launches / migrations reference raw_event_id
+```
+
+## 3. What each topic maps to in your database
+
+| Topic                  | Main table                           | How it is stored/calculated                  |
+| ---------------------- | ------------------------------------ | -------------------------------------------- |
+| New launches           | `launches`                           | mint, name, symbol, creator, launch time     |
+| Creator wallet history | `creators` + `launches`              | count launches per creator                   |
+| Launch time patterns   | `launches`                           | extract hour/day from `launch_time`          |
+| Name/symbol trends     | `launches` + `token_keywords`        | categorize words from name/symbol            |
+| Migration events       | `migrations`                         | mint + migration time                        |
+| Time to migration      | `launches` + `migrations`            | difference between migration and launch time |
+| Creator success rate   | `creators`, `launches`, `migrations` | migrations / launches                        |
+| Duplicate themes       | `launches`                           | repeated names/symbols                       |
+| Raw JSON archive       | `raw_events`                         | full original websocket message              |
+
+## 4. Important SQL examples
+
+### Find creators who launch many tokens
+
+```sql
+SELECT 
+    creator_wallet,
+    COUNT(*) AS total_launches
+FROM launches
+GROUP BY creator_wallet
+ORDER BY total_launches DESC;
+```
+
+### Find tokens that migrated
+
+```sql
+SELECT 
+    l.mint,
+    l.name,
+    l.symbol,
+    l.creator_wallet,
+    l.launch_time,
+    m.migration_time
+FROM launches l
+JOIN migrations m
+    ON l.mint = m.mint;
+```
+
+### Find tokens that did not migrate
+
+```sql
+SELECT 
+    l.mint,
+    l.name,
+    l.symbol,
+    l.creator_wallet,
+    l.launch_time
+FROM launches l
+LEFT JOIN migrations m
+    ON l.mint = m.mint
+WHERE m.mint IS NULL;
+```
+
+### Calculate time to migration
+
+```sql
+SELECT 
+    l.mint,
+    l.name,
+    l.symbol,
+    l.launch_time,
+    m.migration_time,
+    TIMESTAMPDIFF(MINUTE, l.launch_time, m.migration_time) AS minutes_to_migration
+FROM launches l
+JOIN migrations m
+    ON l.mint = m.mint
+ORDER BY minutes_to_migration ASC;
+```
+
+### Creator success rate
+
+```sql
+SELECT 
+    l.creator_wallet,
+    COUNT(DISTINCT l.mint) AS total_launches,
+    COUNT(DISTINCT m.mint) AS total_migrations,
+    ROUND(
+        COUNT(DISTINCT m.mint) / COUNT(DISTINCT l.mint) * 100,
+        2
+    ) AS migration_success_rate
+FROM launches l
+LEFT JOIN migrations m
+    ON l.mint = m.mint
+GROUP BY l.creator_wallet
+ORDER BY migration_success_rate DESC;
+```
+
+### Launches by hour
+
+```sql
+SELECT 
+    HOUR(launch_time) AS launch_hour,
+    COUNT(*) AS total_launches
+FROM launches
+GROUP BY HOUR(launch_time)
+ORDER BY launch_hour;
+```
+
+### Most repeated token names
+
+```sql
+SELECT 
+    name,
+    COUNT(*) AS times_used
+FROM launches
+GROUP BY name
+HAVING COUNT(*) > 1
+ORDER BY times_used DESC;
+```
+
+## 5. Best beginner database design
+
+For your current stage, use this structure:
+
+```text
+raw_events
+creators
+launches
+migrations
+token_keywords
+```
+
+Do **not** create too many tables in the beginning. These five are enough.
+
+Later, when you pay for the trade stream, you can add:
+
+```text
+trades
+wallets
+token_momentum_summary
+creator_trade_behavior
+```
+
+But for now, your free version is already strong.
+
+## 6. The most important rule
+
+Always save the raw JSON first.
+
+Then extract clean fields into relational tables.
+
+So the process should be:
+
+```text
+Websocket message received
+        ↓
+Save full message in raw_events
+        ↓
+If launch: save clean data in launches
+        ↓
+If new creator: save/update creators
+        ↓
+If migration: save clean data in migrations
+        ↓
+Later: calculate patterns using SQL queries
+```
+
+This gives you both safety and structure.
