@@ -1,0 +1,688 @@
+import asyncio
+import json
+from datetime import datetime
+from typing import Optional
+
+import mysql.connector
+import websockets
+
+
+# =========================
+# SETTINGS
+# =========================
+
+MYSQL_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "9677368753",
+    "port": 3306,
+    "database": "binance_1",  # change to "pump_portal_1" if your tables are there
+}
+
+PUMPPORTAL_URL = "wss://pumpportal.fun/api/data"
+
+RUN_TIME_SECONDS = 300  # 5 minutes
+
+REQUIRED_TABLES = [
+    "raw_events",
+    "creators",
+    "launches",
+    "migrations",
+    "token_keywords",
+]
+
+
+# =========================
+# KEYWORD CATEGORIES
+# =========================
+
+KEYWORD_MAP = {
+    # meme
+    "meme": "meme",
+    "doge": "meme",
+    "pepe": "meme",
+    "wojak": "meme",
+    "chad": "meme",
+    "bonk": "meme",
+    "moon": "meme",
+    "pump": "meme",
+    "fun": "meme",
+
+    # AI
+    "ai": "ai",
+    "gpt": "ai",
+    "chatgpt": "ai",
+    "robot": "ai",
+    "bot": "ai",
+    "agent": "ai",
+
+    # animal
+    "cat": "animal",
+    "dog": "animal",
+    "frog": "animal",
+    "rat": "animal",
+    "monkey": "animal",
+    "ape": "animal",
+    "bear": "animal",
+    "bull": "animal",
+    "fish": "animal",
+    "bird": "animal",
+
+    # celebrity / public-person theme
+    "trump": "political",
+    "biden": "political",
+    "elon": "celebrity",
+    "musk": "celebrity",
+    "tate": "celebrity",
+
+    # crypto
+    "bitcoin": "crypto",
+    "btc": "crypto",
+    "eth": "crypto",
+    "sol": "crypto",
+    "solana": "crypto",
+    "crypto": "crypto",
+    "coin": "crypto",
+
+    # gaming / internet
+    "game": "gaming",
+    "gaming": "gaming",
+    "minecraft": "gaming",
+    "pokemon": "gaming",
+    "pikachu": "gaming",
+    "tiktok": "internet_trend",
+    "twitter": "internet_trend",
+    "x": "internet_trend",
+}
+
+
+# =========================
+# MYSQL CONNECTION
+# =========================
+
+mydb = mysql.connector.connect(**MYSQL_CONFIG)
+cursor = mydb.cursor()
+
+print("Connected to MySQL successfully.")
+print("Database:", MYSQL_CONFIG["database"])
+
+
+# =========================
+# BASIC CHECKS
+# =========================
+
+def check_required_tables():
+    """
+    Checks if all required tables exist before the collector starts.
+    This prevents the code from running and failing later.
+    """
+    cursor.execute("SHOW TABLES")
+    existing_tables = {row[0] for row in cursor.fetchall()}
+
+    missing_tables = []
+
+    for table in REQUIRED_TABLES:
+        if table not in existing_tables:
+            missing_tables.append(table)
+
+    if missing_tables:
+        raise Exception(f"Missing tables in database {MYSQL_CONFIG['database']}: {missing_tables}")
+
+    print("All required tables exist.")
+
+
+# =========================
+# HELPER FUNCTIONS
+# =========================
+
+def now_datetime() -> datetime:
+    """
+    Returns current local datetime.
+    We use this as received_at because PumpPortal creation messages do not always provide a clean event timestamp.
+    """
+    return datetime.now()
+
+
+def clean_text(value: Optional[str]) -> Optional[str]:
+    """
+    Cleans token name/symbol:
+    - Converts to string
+    - Removes extra spaces
+    - Converts empty text into None
+    """
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
+    if value == "":
+        return None
+
+    return value
+
+
+def lower_text(value: Optional[str]) -> Optional[str]:
+    """
+    Creates lowercase version for analysis/searching.
+    Example:
+    'Bitcoin Coin' -> 'bitcoin coin'
+    """
+    value = clean_text(value)
+
+    if value is None:
+        return None
+
+    return value.lower()
+
+
+def get_launch_time_parts(received_at: datetime):
+    """
+    Creates useful time fields for the launches table:
+    - launch_date
+    - launch_hour
+    - launch_day_of_week
+
+    Python weekday:
+    Monday = 0
+    Sunday = 6
+
+    Here we store:
+    Monday = 1
+    Sunday = 7
+    """
+    launch_date = received_at.date()
+    launch_hour = received_at.hour
+    launch_day_of_week = received_at.weekday() + 1
+
+    return launch_date, launch_hour, launch_day_of_week
+
+
+def detect_keywords(name: Optional[str], symbol: Optional[str]):
+    """
+    Detects simple keywords from token name and symbol.
+    Returns a list of:
+    (keyword, category, source_field)
+    """
+    detected = []
+
+    name_clean = lower_text(name) or ""
+    symbol_clean = lower_text(symbol) or ""
+
+    for keyword, category in KEYWORD_MAP.items():
+        in_name = keyword in name_clean
+        in_symbol = keyword in symbol_clean
+
+        if in_name and in_symbol:
+            source_field = "both"
+        elif in_name:
+            source_field = "name"
+        elif in_symbol:
+            source_field = "symbol"
+        else:
+            continue
+
+        detected.append((keyword, category, source_field))
+
+    return detected
+
+
+# =========================
+# RAW EVENTS
+# =========================
+
+def save_raw_event(event_type: str, mint: Optional[str], received_at: datetime, data: dict) -> int:
+    """
+    Saves full original PumpPortal JSON into raw_events.
+    This is important because even if we miss a column now, raw_json keeps everything.
+    """
+    sql = """
+    INSERT INTO raw_events (
+        event_type,
+        mint,
+        received_at,
+        raw_json
+    )
+    VALUES (%s, %s, %s, %s)
+    """
+
+    values = (
+        event_type,
+        mint,
+        received_at,
+        json.dumps(data, ensure_ascii=False),
+    )
+
+    cursor.execute(sql, values)
+    mydb.commit()
+
+    return cursor.lastrowid
+
+
+# =========================
+# CREATORS
+# =========================
+
+def ensure_creator_exists(creator_wallet: str, seen_at: datetime):
+    """
+    Creates a creator row if this wallet has never been seen.
+    We do not increase total_launches here.
+    total_launches is increased only after a new launch is successfully inserted.
+    """
+    sql = """
+    INSERT INTO creators (
+        creator_wallet,
+        first_seen_at,
+        last_seen_at,
+        total_launches,
+        total_migrations
+    )
+    VALUES (%s, %s, %s, 0, 0)
+    ON DUPLICATE KEY UPDATE
+        last_seen_at = VALUES(last_seen_at)
+    """
+
+    values = (
+        creator_wallet,
+        seen_at,
+        seen_at,
+    )
+
+    cursor.execute(sql, values)
+    mydb.commit()
+
+
+def increase_creator_launch_count(creator_wallet: str, seen_at: datetime):
+    """
+    Increases creator launch count after a new mint is saved into launches.
+    """
+    sql = """
+    UPDATE creators
+    SET 
+        total_launches = total_launches + 1,
+        last_seen_at = %s
+    WHERE creator_wallet = %s
+    """
+
+    cursor.execute(sql, (seen_at, creator_wallet))
+    mydb.commit()
+
+
+def increase_creator_migration_count(creator_wallet: str, seen_at: datetime):
+    """
+    Increases creator migration count when one of their tokens migrates.
+    """
+    sql = """
+    UPDATE creators
+    SET 
+        total_migrations = total_migrations + 1,
+        last_seen_at = %s
+    WHERE creator_wallet = %s
+    """
+
+    cursor.execute(sql, (seen_at, creator_wallet))
+    mydb.commit()
+
+
+# =========================
+# LAUNCHES
+# =========================
+
+def get_duplicate_counts(name_lower: Optional[str], symbol_lower: Optional[str]):
+    """
+    Counts how many times this token name/symbol already appeared before this launch.
+    This helps detect repeated names and copycat launches.
+    """
+    duplicate_name_count = 0
+    duplicate_symbol_count = 0
+
+    if name_lower:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM launches
+            WHERE name_lower = %s
+            """,
+            (name_lower,)
+        )
+        duplicate_name_count = cursor.fetchone()[0]
+
+    if symbol_lower:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM launches
+            WHERE symbol_lower = %s
+            """,
+            (symbol_lower,)
+        )
+        duplicate_symbol_count = cursor.fetchone()[0]
+
+    return duplicate_name_count, duplicate_symbol_count
+
+
+def save_launch(data: dict, raw_event_id: int, received_at: datetime):
+    """
+    Saves new token launch data into launches.
+    Also updates creators and token_keywords.
+    """
+    mint = data.get("mint")
+    name = clean_text(data.get("name"))
+    symbol = clean_text(data.get("symbol"))
+    creator_wallet = data.get("traderPublicKey")
+
+    if not mint:
+        print("Skipped launch because mint is missing.")
+        return
+
+    if not creator_wallet:
+        print("Skipped launch because creator wallet is missing:", mint)
+        return
+
+    name_lower = lower_text(name)
+    symbol_lower = lower_text(symbol)
+
+    launch_date, launch_hour, launch_day_of_week = get_launch_time_parts(received_at)
+
+    duplicate_name_count, duplicate_symbol_count = get_duplicate_counts(name_lower, symbol_lower)
+
+    ensure_creator_exists(creator_wallet, received_at)
+
+    sql = """
+    INSERT IGNORE INTO launches (
+        mint,
+        name,
+        symbol,
+        creator_wallet,
+        launch_time,
+        received_at,
+        raw_event_id,
+        name_lower,
+        symbol_lower,
+        launch_date,
+        launch_hour,
+        launch_day_of_week,
+        duplicate_name_count_at_launch,
+        duplicate_symbol_count_at_launch
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+
+    values = (
+        mint,
+        name,
+        symbol,
+        creator_wallet,
+        received_at,
+        received_at,
+        raw_event_id,
+        name_lower,
+        symbol_lower,
+        launch_date,
+        launch_hour,
+        launch_day_of_week,
+        duplicate_name_count,
+        duplicate_symbol_count,
+    )
+
+    cursor.execute(sql, values)
+    mydb.commit()
+
+    # rowcount = 1 means a new launch was inserted.
+    # rowcount = 0 means mint already existed and was ignored.
+    if cursor.rowcount == 1:
+        increase_creator_launch_count(creator_wallet, received_at)
+        save_token_keywords(mint, name, symbol, received_at)
+
+        print("Saved launch:", name, "|", symbol, "|", mint)
+    else:
+        print("Duplicate launch ignored:", mint)
+
+
+# =========================
+# TOKEN KEYWORDS
+# =========================
+
+def save_token_keywords(mint: str, name: Optional[str], symbol: Optional[str], detected_at: datetime):
+    """
+    Saves detected token keyword themes.
+    Example:
+    token name = 'AI Doge'
+    keywords = ai, doge
+    """
+    keywords = detect_keywords(name, symbol)
+
+    if not keywords:
+        return
+
+    sql = """
+    INSERT IGNORE INTO token_keywords (
+        mint,
+        keyword,
+        category,
+        source_field,
+        detected_at
+    )
+    VALUES (%s, %s, %s, %s, %s)
+    """
+
+    for keyword, category, source_field in keywords:
+        values = (
+            mint,
+            keyword,
+            category,
+            source_field,
+            detected_at,
+        )
+
+        cursor.execute(sql, values)
+
+    mydb.commit()
+
+
+# =========================
+# MIGRATIONS
+# =========================
+
+def save_migration(data: dict, raw_event_id: int, received_at: datetime):
+    """
+    Saves migration data.
+
+    Important:
+    migrations table has a foreign key to launches(mint).
+    So if the migrated token was created before our collector started,
+    it may not exist in launches. In that case, we store raw_events but skip migrations.
+    """
+    mint = data.get("mint")
+
+    if not mint:
+        print("Skipped migration because mint is missing.")
+        return
+
+    cursor.execute(
+        """
+        SELECT launch_time, creator_wallet
+        FROM launches
+        WHERE mint = %s
+        LIMIT 1
+        """,
+        (mint,)
+    )
+
+    launch_row = cursor.fetchone()
+
+    if not launch_row:
+        print("Migration found but launch not in our database. Raw event saved only:", mint)
+        return
+
+    launch_time = launch_row[0]
+    creator_wallet = launch_row[1]
+
+    minutes_from_launch = None
+
+    if launch_time:
+        seconds = (received_at - launch_time).total_seconds()
+        minutes_from_launch = int(seconds // 60)
+
+    sql = """
+    INSERT IGNORE INTO migrations (
+        mint,
+        migration_time,
+        received_at,
+        raw_event_id,
+        minutes_from_launch,
+        migration_status
+    )
+    VALUES (%s, %s, %s, %s, %s, 'confirmed')
+    """
+
+    values = (
+        mint,
+        received_at,
+        received_at,
+        raw_event_id,
+        minutes_from_launch,
+    )
+
+    cursor.execute(sql, values)
+    mydb.commit()
+
+    if cursor.rowcount == 1:
+        cursor.execute(
+            """
+            UPDATE launches
+            SET 
+                is_migrated = TRUE,
+                migration_time = %s,
+                minutes_to_migration = %s
+            WHERE mint = %s
+            """,
+            (received_at, minutes_from_launch, mint)
+        )
+        mydb.commit()
+
+        if creator_wallet:
+            increase_creator_migration_count(creator_wallet, received_at)
+
+        print("Saved migration:", mint, "| minutes from launch:", minutes_from_launch)
+    else:
+        print("Duplicate migration ignored:", mint)
+
+
+# =========================
+# EVENT HANDLER
+# =========================
+
+def handle_event(data: dict):
+    """
+    Decides whether a PumpPortal message is a launch or migration.
+    Then saves it to the correct tables.
+    """
+    if data.get("message"):
+        print("Info:", data.get("message"))
+        return
+
+    mint = data.get("mint")
+    tx_type = data.get("txType")
+    received_at = now_datetime()
+
+    # New token creation event
+    if tx_type == "create":
+        raw_event_id = save_raw_event(
+            event_type="launch",
+            mint=mint,
+            received_at=received_at,
+            data=data
+        )
+
+        save_launch(
+            data=data,
+            raw_event_id=raw_event_id,
+            received_at=received_at
+        )
+
+    # Migration event
+    else:
+        raw_event_id = save_raw_event(
+            event_type="migration",
+            mint=mint,
+            received_at=received_at,
+            data=data
+        )
+
+        save_migration(
+            data=data,
+            raw_event_id=raw_event_id,
+            received_at=received_at
+        )
+
+
+# =========================
+# MAIN WEBSOCKET COLLECTOR
+# =========================
+
+async def collect_for_5_minutes():
+    """
+    Connects to PumpPortal and listens for:
+    - new token launches
+    - migrations
+
+    Runs for exactly 5 minutes.
+    """
+    start_time = asyncio.get_running_loop().time()
+    end_time = start_time + RUN_TIME_SECONDS
+
+    async with websockets.connect(PUMPPORTAL_URL) as websocket:
+        print("Connected to PumpPortal WebSocket.")
+
+        await websocket.send(json.dumps({
+            "method": "subscribeNewToken"
+        }))
+        print("Subscribed to new token events.")
+
+        await websocket.send(json.dumps({
+            "method": "subscribeMigration"
+        }))
+        print("Subscribed to migration events.")
+
+        while True:
+            current_time = asyncio.get_running_loop().time()
+
+            if current_time >= end_time:
+                print("5-minute time limit reached. Stopping collector.")
+                break
+
+            remaining_time = end_time - current_time
+
+            try:
+                message = await asyncio.wait_for(
+                    websocket.recv(),
+                    timeout=remaining_time
+                )
+
+                data = json.loads(message)
+                handle_event(data)
+
+            except asyncio.TimeoutError:
+                print("5-minute time limit reached. Stopping collector.")
+                break
+
+            except json.JSONDecodeError:
+                print("Received non-JSON message:", message)
+
+            except Exception as error:
+                print("Error while processing message:", error)
+                print("Message was:", message)
+
+
+# =========================
+# RUN PROGRAM
+# =========================
+
+try:
+    check_required_tables()
+    asyncio.run(collect_for_5_minutes())
+
+finally:
+    cursor.close()
+    mydb.close()
+    print("MySQL connection closed.")
