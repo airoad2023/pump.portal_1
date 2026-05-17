@@ -1,0 +1,65 @@
+CREATE DATABASE telegram_data;
+
+USE telegram_data;
+
+USE pump_portal_1;
+
+DROP TABLE IF EXISTS telegram_messages;
+
+CREATE TABLE telegram_messages (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+
+    -- Telegram source/channel information
+    channel_username VARCHAR(255),
+    channel_title VARCHAR(255),
+    channel_id BIGINT,
+
+    -- Telegram message identity
+    message_id BIGINT,
+    message_url TEXT,
+
+    -- Message content
+    message_text LONGTEXT,
+    message_date DATETIME,
+
+    -- Sender/user information
+    sender_id BIGINT,
+    sender_username VARCHAR(255),
+    sender_first_name VARCHAR(255),
+    sender_last_name VARCHAR(255),
+
+    -- Engagement data
+    views INT DEFAULT 0,
+    forwards INT DEFAULT 0,
+    replies INT DEFAULT 0,
+    reactions_count INT DEFAULT 0,
+
+    -- Detected crypto/token data from message text
+    detected_mint VARCHAR(255),
+    detected_pumpfun_link TEXT,
+    detected_dexscreener_link TEXT,
+    detected_birdeye_link TEXT,
+    detected_ticker VARCHAR(100),
+
+    -- Matching later with PumpPortal
+    matched_mint VARCHAR(255),
+    matched_launch_id INT,
+
+    -- Collection metadata
+    collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    -- Full original Telegram message data
+    raw_json JSON,
+
+    -- Prevent saving the same message again from the same channel
+    UNIQUE KEY unique_telegram_message (channel_id, message_id),
+
+    -- Useful indexes for analysis
+    INDEX idx_channel_username (channel_username),
+    INDEX idx_channel_id (channel_id),
+    INDEX idx_message_date (message_date),
+    INDEX idx_detected_mint (detected_mint),
+    INDEX idx_detected_ticker (detected_ticker),
+    INDEX idx_matched_mint (matched_mint),
+    INDEX idx_collected_at (collected_at)
+);
